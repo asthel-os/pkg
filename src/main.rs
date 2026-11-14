@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod hooks;
 mod i18n;
 mod manager;
 mod models;

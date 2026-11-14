@@ -1,4 +1,5 @@
 use crate::config::{is_root, ConfigManager};
+use crate::hooks;
 use crate::i18n::Lang;
 use crate::models::{GitPackagesManifest, IndexedPackage, InstalledPackage, MasterManifest};
 use crate::repo::{
@@ -20,6 +21,7 @@ use std::sync::Mutex;
 pub fn cmd_update(cfg: &ConfigManager) -> Result<(), String> {
     let lang = Lang::detect();
     cfg.require_root(lang)?;
+    hooks::run_hooks(cfg, "pre", "update", &[])?;
 
     let mut db = cfg.load_db();
 
@@ -236,6 +238,7 @@ pub fn cmd_update(cfg: &ConfigManager) -> Result<(), String> {
     ui::finish_progress_bar(lang);
 
     ui::success("SYNC", &lang.sync_done(total_tasks, new_index.len()));
+    hooks::run_hooks(cfg, "post", "update", &[])?;
     Ok(())
 }
 
@@ -673,9 +676,31 @@ pub fn cmd_install(
     packages: &[String],
     yes: bool,
     reinstall: bool,
+    no_recommends: bool,
+    fix_broken: bool,
+    download_only: bool,
+) -> Result<(), String> {
+    cmd_install_with_event(
+        cfg,
+        packages,
+        yes,
+        reinstall,
+        no_recommends,
+        fix_broken,
+        download_only,
+        "install",
+    )
+}
+
+fn cmd_install_with_event(
+    cfg: &ConfigManager,
+    packages: &[String],
+    yes: bool,
+    reinstall: bool,
     _no_recommends: bool,
     _fix_broken: bool,
     download_only: bool,
+    event_name: &str,
 ) -> Result<(), String> {
     let lang = Lang::detect();
     cfg.require_root(lang)?;
@@ -851,6 +876,12 @@ pub fn cmd_install(
         return Ok(());
     }
 
+    let affected_names: Vec<String> = downloaded_paths
+        .iter()
+        .map(|(pkg, _)| pkg.name.clone())
+        .collect();
+    hooks::run_hooks(cfg, "pre", event_name, &affected_names)?;
+
     for (idx, (pkg, archive_path)) in downloaded_paths.into_iter().enumerate() {
         current_step += 1;
         ui::action_line(
@@ -896,6 +927,7 @@ pub fn cmd_install(
     }
 
     ui::finish_progress_bar(lang);
+    hooks::run_hooks(cfg, "post", event_name, &affected_names)?;
     Ok(())
 }
 
@@ -906,6 +938,17 @@ pub fn cmd_remove(
     packages: &[String],
     purge: bool,
     yes: bool,
+) -> Result<(), String> {
+    let event_name = if purge { "purge" } else { "remove" };
+    cmd_remove_with_event(cfg, packages, purge, yes, event_name)
+}
+
+fn cmd_remove_with_event(
+    cfg: &ConfigManager,
+    packages: &[String],
+    purge: bool,
+    yes: bool,
+    event_name: &str,
 ) -> Result<(), String> {
     let lang = Lang::detect();
     cfg.require_root(lang)?;
@@ -1018,6 +1061,9 @@ pub fn cmd_remove(
     let mut current_step = 0usize;
     ui::draw_progress_bar(lang, 0, total_steps);
 
+    let affected_names: Vec<String> = to_remove.iter().map(|r| r.name.clone()).collect();
+    hooks::run_hooks(cfg, "pre", event_name, &affected_names)?;
+
     for (idx, rem) in to_remove.iter().enumerate() {
         current_step += 1;
         let sz = if rem.installed_size > 0 {
@@ -1066,6 +1112,7 @@ pub fn cmd_remove(
     }
 
     ui::finish_progress_bar(lang);
+    hooks::run_hooks(cfg, "post", event_name, &affected_names)?;
     Ok(())
 }
 
@@ -1318,9 +1365,10 @@ fn install_extracted_files_recursive(
 }
 
 /// `sudo pkg upgrade` / `sudo pkg full-upgrade`
-pub fn cmd_upgrade(cfg: &ConfigManager, _full: bool, yes: bool) -> Result<(), String> {
+pub fn cmd_upgrade(cfg: &ConfigManager, full: bool, yes: bool) -> Result<(), String> {
     let lang = Lang::detect();
     cfg.require_root(lang)?;
+    let event_name = if full { "full-upgrade" } else { "upgrade" };
 
     ui::info("DEPS", lang.resolving_deps());
 
@@ -1341,10 +1389,11 @@ pub fn cmd_upgrade(cfg: &ConfigManager, _full: bool, yes: bool) -> Result<(), St
 
     if to_upgrade.is_empty() {
         ui::success("UPGRADE", "All packages are up to date.");
+        hooks::run_hooks(cfg, "post", event_name, &[])?;
         return Ok(());
     }
 
-    cmd_install(cfg, &to_upgrade, yes, true, false, false, false)
+    cmd_install_with_event(cfg, &to_upgrade, yes, true, false, false, false, event_name)
 }
 
 /// `sudo pkg autoremove`
@@ -1365,7 +1414,7 @@ pub fn cmd_autoremove(cfg: &ConfigManager, purge: bool, yes: bool) -> Result<(),
         return Ok(());
     }
 
-    cmd_remove(cfg, &orphans, purge, yes)
+    cmd_remove_with_event(cfg, &orphans, purge, yes, "autoremove")
 }
 
 /// `pkg search <query>`

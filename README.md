@@ -119,3 +119,25 @@ sudo pkg repo remove asthel-os/pkg-master
   ]
 }
 ```
+
+---
+
+## Hooks (`/etc/pkg/hooks.d/*.json`)
+
+`pkg` supports `pre` and `post` hooks for any action (`install`, `upgrade`, `full-upgrade`, `remove`, `purge`, `autoremove`, `update`, or `*`). Drop a `.json` file into `/etc/pkg/hooks.d/` (or `/var/lib/pkg/hooks/`) to trigger external tools such as `asthel-upgrader`:
+
+```json
+{
+  "name": "asthel-upgrader",
+  "description": "Run AsthelOS system upgrader after upgrade",
+  "when": "post",
+  "events": ["upgrade", "full-upgrade"],
+  "packages": [],
+  "exec": "/usr/bin/asthel-upgrader",
+  "args": ["--post-upgrade"],
+  "ignore_failure": false
+}
+```
+
+Hooks receive `PKG_HOOK_EVENT`, `PKG_HOOK_WHEN`, `PKG_HOOK_PACKAGES`, and `PKG_INSTALL_ROOT` as environment variables.
+
