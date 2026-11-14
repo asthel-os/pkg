@@ -6,14 +6,26 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-fn detect_target_os_version(root_manifest_ver: Option<&str>) -> Option<String> {
+fn detect_target_os_version() -> Option<String> {
     if let Ok(v) = std::env::var("PKG_VERSION") {
         let trimmed = v.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
         }
     }
-    if let Ok(os_rel) = fs::read_to_string("/etc/os-release") {
+
+    let os_rel_path = if let Ok(root) = std::env::var("PKG_INSTALL_ROOT") {
+        let p = Path::new(&root).join("etc/os-release");
+        if p.exists() {
+            p
+        } else {
+            Path::new("/etc/os-release").to_path_buf()
+        }
+    } else {
+        Path::new("/etc/os-release").to_path_buf()
+    };
+
+    if let Ok(os_rel) = fs::read_to_string(&os_rel_path) {
         let mut is_asthel = false;
         let mut ver_id = None;
         for line in os_rel.lines() {
@@ -33,31 +45,120 @@ fn detect_target_os_version(root_manifest_ver: Option<&str>) -> Option<String> {
             return ver_id;
         }
     }
-    root_manifest_ver.map(|s| s.to_string())
+    None
+}
+
+fn compare_versions_desc(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse_parts = |s: &str| -> Vec<(u64, String)> {
+        s.split('.')
+            .map(|p| (p.parse::<u64>().unwrap_or(0), p.to_string()))
+            .collect()
+    };
+    let pa = parse_parts(a);
+    let pb = parse_parts(b);
+    pb.cmp(&pa)
+}
+
+fn find_latest_local_version(dir: &Path) -> Option<String> {
+    let versions_dir = dir.join("versions");
+    let entries = fs::read_dir(&versions_dir).ok()?;
+    let mut candidates: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir() && e.path().join("repository.json").exists())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    candidates.sort_by(|a, b| compare_versions_desc(a, b));
+    candidates.into_iter().next()
+}
+
+fn find_latest_github_version(slug: &str) -> Result<String, String> {
+    let api_url = format!("https://api.github.com/repos/{slug}/contents/versions");
+    let out = Command::new("curl")
+        .args([
+            "-sLf",
+            "--connect-timeout",
+            "8",
+            "--max-time",
+            "20",
+            "--retry",
+            "1",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "User-Agent: asthelos-pkg/0.1.0",
+            "-H",
+            "Cache-Control: no-cache",
+            &api_url,
+        ])
+        .output()
+        .map_err(|e| format!("Failed to execute curl: {e}"))?;
+
+    if !out.status.success() || out.stdout.is_empty() {
+        return Err(format!("Could not list versions/ in '{slug}'"));
+    }
+
+    let items: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|_| format!("Invalid GitHub API response for '{slug}/versions'"))?;
+    let arr = items
+        .as_array()
+        .ok_or_else(|| format!("Unexpected GitHub API format for '{slug}/versions'"))?;
+
+    let mut dirs: Vec<String> = arr
+        .iter()
+        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("dir"))
+        .filter_map(|item| {
+            item.get("name")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    dirs.sort_by(|a, b| compare_versions_desc(a, b));
+    dirs.into_iter()
+        .next()
+        .ok_or_else(|| format!("No version directories found in '{slug}/versions'"))
 }
 
 pub fn resolve_master_manifest_local(dir: &Path) -> Result<MasterManifest, String> {
-    let manifest = ConfigManager::load_manifest_from_dir(dir)?;
-    if let Some(ver) = detect_target_os_version(manifest.version.as_deref()) {
+    if let Some(ver) = detect_target_os_version() {
         let ver_dir = dir.join("versions").join(&ver);
         if ver_dir.join("repository.json").exists() {
-            if let Ok(mut ver_manifest) = ConfigManager::load_manifest_from_dir(&ver_dir) {
-                if ver_manifest.name.is_empty() {
-                    ver_manifest.name = manifest.name;
-                }
-                return Ok(ver_manifest);
-            }
+            return ConfigManager::load_manifest_from_dir(&ver_dir);
         }
+        if dir.join("versions").is_dir() {
+            return Err(format!(
+                "Version '{ver}' not found in '{}/versions'",
+                dir.display()
+            ));
+        }
+    } else if let Some(latest) = find_latest_local_version(dir) {
+        let ver_dir = dir.join("versions").join(&latest);
+        return ConfigManager::load_manifest_from_dir(&ver_dir);
     }
-    Ok(manifest)
+
+    ConfigManager::load_manifest_from_dir(dir)
 }
 
 pub fn resolve_master_manifest_github(slug: &str) -> Result<MasterManifest, String> {
+    if let Some(ver) = detect_target_os_version() {
+        let ver_path = format!("versions/{ver}/repository.json");
+        if let Ok(ver_raw) = fetch_github_raw_file(slug, &ver_path) {
+            return serde_json::from_str::<MasterManifest>(&ver_raw)
+                .map_err(|_| format!("Invalid {ver_path} in master repo '{slug}'"));
+        }
+    } else if let Ok(latest) = find_latest_github_version(slug) {
+        let ver_path = format!("versions/{latest}/repository.json");
+        if let Ok(ver_raw) = fetch_github_raw_file(slug, &ver_path) {
+            return serde_json::from_str::<MasterManifest>(&ver_raw)
+                .map_err(|_| format!("Invalid {ver_path} in master repo '{slug}'"));
+        }
+    }
+
+    // Backwards-compatible fallback for master repos with a root repository.json
     let raw_json = fetch_github_raw_file(slug, "repository.json")?;
     let manifest = serde_json::from_str::<MasterManifest>(&raw_json)
         .map_err(|_| "Invalid repository.json in master repo".to_string())?;
 
-    if let Some(ver) = detect_target_os_version(manifest.version.as_deref()) {
+    if let Some(ver) = manifest.version.as_deref() {
         let ver_path = format!("versions/{ver}/repository.json");
         if let Ok(ver_raw) = fetch_github_raw_file(slug, &ver_path) {
             if let Ok(mut ver_manifest) = serde_json::from_str::<MasterManifest>(&ver_raw) {
@@ -91,11 +192,10 @@ pub fn add_github(cfg: &ConfigManager, target: &str) -> Result<(), String> {
         ));
     }
 
-    // Check if the GitHub repository contains a master `repository.json` (or `versions/<ver>/repository.json`)
+    // Check if the GitHub repository contains `versions/<ver>/repository.json` (or a root `repository.json`)
     if let Ok(manifest) = resolve_master_manifest_github(&slug) {
-        let raw_json_url =
-            format!("https://raw.githubusercontent.com/{slug}/HEAD/repository.json");
-        return register_master_manifest(cfg, manifest, &slug, &raw_json_url);
+        let repo_url = format!("https://github.com/{slug}");
+        return register_master_manifest(cfg, manifest, &slug, &repo_url);
     }
 
     // Otherwise, register as a direct GitHub Releases repository (`<owner>/<repo>`)
