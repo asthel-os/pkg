@@ -1,0 +1,146 @@
+name: Create Release (.deb)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.1.0)"
+        required: true
+        default: "0.1.0"
+        type: string
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    name: Build .deb (${{ matrix.deb_arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - deb_arch: amd64
+            rust_target: x86_64-unknown-linux-gnu
+            gcc_pkg: gcc
+            strip_bin: strip
+          - deb_arch: arm64
+            rust_target: aarch64-unknown-linux-gnu
+            gcc_pkg: gcc-aarch64-linux-gnu
+            strip_bin: aarch64-linux-gnu-strip
+          - deb_arch: armhf
+            rust_target: armv7-unknown-linux-gnueabihf
+            gcc_pkg: gcc-arm-linux-gnueabihf
+            strip_bin: arm-linux-gnueabihf-strip
+          - deb_arch: ppc64el
+            rust_target: powerpc64le-unknown-linux-gnu
+            gcc_pkg: gcc-powerpc64le-linux-gnu
+            strip_bin: powerpc64le-linux-gnu-strip
+          - deb_arch: riscv64
+            rust_target: riscv64gc-unknown-linux-gnu
+            gcc_pkg: gcc-riscv64-linux-gnu
+            strip_bin: riscv64-linux-gnu-strip
+          - deb_arch: s390x
+            rust_target: s390x-unknown-linux-gnu
+            gcc_pkg: gcc-s390x-linux-gnu
+            strip_bin: s390x-linux-gnu-strip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.gcc_pkg }} dpkg-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Set version in Cargo.toml
+        run: |
+          CLEAN_VER="${{ inputs.version }}"
+          CLEAN_VER="${CLEAN_VER#v}"
+          sed -i "s/^version = .*/version = \"${CLEAN_VER}\"/" Cargo.toml
+
+      - name: Build pkg (${{ matrix.deb_arch }})
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          CARGO_TARGET_POWERPC64LE_UNKNOWN_LINUX_GNU_LINKER: powerpc64le-linux-gnu-gcc
+          CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+          CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_LINKER: s390x-linux-gnu-gcc
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }}
+          ${{ matrix.strip_bin }} target/${{ matrix.rust_target }}/release/pkg
+
+      - name: Build .deb package (${{ matrix.deb_arch }})
+        run: |
+          CLEAN_VER="${{ inputs.version }}"
+          CLEAN_VER="${CLEAN_VER#v}"
+          PKG_DIR="pkg_${CLEAN_VER}_${{ matrix.deb_arch }}"
+
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          mkdir -p "${PKG_DIR}/usr/bin"
+          mkdir -p "${PKG_DIR}/var/lib/pkg/repos"
+          mkdir -p "${PKG_DIR}/var/lib/pkg/lists"
+          mkdir -p "${PKG_DIR}/var/cache/pkg/archives"
+
+          install -Dm755 "target/${{ matrix.rust_target }}/release/pkg" "${PKG_DIR}/usr/bin/pkg"
+          INSTALLED_KB=$(du -sk "${PKG_DIR}/usr" | cut -f1)
+
+          cat <<EOF > "${PKG_DIR}/DEBIAN/control"
+          Package: pkg
+          Version: ${CLEAN_VER}
+          Section: admin
+          Priority: required
+          Architecture: ${{ matrix.deb_arch }}
+          Installed-Size: ${INSTALLED_KB}
+          Depends: curl, dpkg, gzip, xz-utils, tar
+          Maintainer: AsthelOS Team <dev@asthelos.org>
+          Homepage: https://github.com/asthel-os/pkg
+          Description: Official AsthelOS Package Manager (GitHub Releases, PPA, and DEB)
+          EOF
+
+          dpkg-deb --build --root-owner-group "${PKG_DIR}" "pkg_${CLEAN_VER}_${{ matrix.deb_arch }}.deb"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-deb-${{ matrix.deb_arch }}
+          path: "pkg_*_${{ matrix.deb_arch }}.deb"
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-deb
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all .deb packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum *.deb > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release with .deb packages
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: "AsthelOS pkg v${{ inputs.version }}"
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            dist/*.deb
+            dist/SHA256SUMS
