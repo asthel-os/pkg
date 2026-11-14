@@ -1,6 +1,6 @@
 use crate::config::ConfigManager;
 use crate::i18n::Lang;
-use crate::models::{MasterManifest, RegisteredSource, RepoEntry};
+use crate::models::{MasterManifest, RegisteredSource, RepoEntry, RootManifest};
 use crate::ui::{self, BOLD, CYAN, DIM, RESET};
 use std::fs;
 use std::path::Path;
@@ -59,20 +59,20 @@ fn compare_versions_desc(a: &str, b: &str) -> std::cmp::Ordering {
     pb.cmp(&pa)
 }
 
-fn find_latest_local_version(dir: &Path) -> Option<String> {
-    let versions_dir = dir.join("versions");
+fn find_latest_local_version(dir: &Path, versions_dir_name: &str, repo_file: &str) -> Option<String> {
+    let versions_dir = dir.join(versions_dir_name);
     let entries = fs::read_dir(&versions_dir).ok()?;
     let mut candidates: Vec<String> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir() && e.path().join("repository.json").exists())
+        .filter(|e| e.path().is_dir() && e.path().join(repo_file).exists())
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
     candidates.sort_by(|a, b| compare_versions_desc(a, b));
     candidates.into_iter().next()
 }
 
-fn find_latest_github_version(slug: &str) -> Result<String, String> {
-    let api_url = format!("https://api.github.com/repos/{slug}/contents/versions");
+fn find_latest_github_version(slug: &str, versions_dir_name: &str) -> Result<String, String> {
+    let api_url = format!("https://api.github.com/repos/{slug}/contents/{versions_dir_name}");
     let out = Command::new("curl")
         .args([
             "-sLf",
@@ -94,14 +94,14 @@ fn find_latest_github_version(slug: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to execute curl: {e}"))?;
 
     if !out.status.success() || out.stdout.is_empty() {
-        return Err(format!("Could not list versions/ in '{slug}'"));
+        return Err(format!("Could not list {versions_dir_name}/ in '{slug}'"));
     }
 
     let items: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|_| format!("Invalid GitHub API response for '{slug}/versions'"))?;
+        .map_err(|_| format!("Invalid GitHub API response for '{slug}/{versions_dir_name}'"))?;
     let arr = items
         .as_array()
-        .ok_or_else(|| format!("Unexpected GitHub API format for '{slug}/versions'"))?;
+        .ok_or_else(|| format!("Unexpected GitHub API format for '{slug}/{versions_dir_name}'"))?;
 
     let mut dirs: Vec<String> = arr
         .iter()
@@ -115,10 +115,101 @@ fn find_latest_github_version(slug: &str) -> Result<String, String> {
     dirs.sort_by(|a, b| compare_versions_desc(a, b));
     dirs.into_iter()
         .next()
-        .ok_or_else(|| format!("No version directories found in '{slug}/versions'"))
+        .ok_or_else(|| format!("No version directories found in '{slug}/{versions_dir_name}'"))
+}
+
+fn resolve_root_manifest_with(
+    root: RootManifest,
+    read_file: &dyn Fn(&str) -> Result<String, String>,
+    find_latest_ver: &dyn Fn(&str, &str) -> Option<String>,
+) -> Result<MasterManifest, String> {
+    let mode = root.repo_type.trim().to_lowercase();
+    let versions_dir = root
+        .versions_dir
+        .as_deref()
+        .unwrap_or("versions")
+        .trim_matches('/');
+    let repo_file = root
+        .repository_file
+        .as_deref()
+        .unwrap_or("repository.json")
+        .trim_start_matches('/');
+
+    let parse_master = |rel_path: &str| -> Result<MasterManifest, String> {
+        let raw = read_file(rel_path)?;
+        let mut manifest = serde_json::from_str::<MasterManifest>(&raw)
+            .map_err(|e| format!("Invalid JSON in '{rel_path}': {e}"))?;
+        if manifest.name.is_empty() && !root.name.is_empty() {
+            manifest.name = root.name.clone();
+        }
+        Ok(manifest)
+    };
+
+    if mode == "versioned" || (mode.is_empty() && root.versions_dir.is_some()) {
+        let target_ver = detect_target_os_version()
+            .or_else(|| root.default_version.clone())
+            .or_else(|| find_latest_ver(versions_dir, repo_file))
+            .ok_or_else(|| format!("No release version found under '{versions_dir}/'"))?;
+
+        let rel_path = format!("{versions_dir}/{target_ver}/{repo_file}");
+        return parse_master(&rel_path);
+    }
+
+    if mode == "packages" || mode == "git" {
+        let pkg_file = root
+            .packages_file
+            .as_deref()
+            .unwrap_or("packages.json")
+            .trim_start_matches('/');
+        let ns = if root.name.is_empty() {
+            "repo".to_string()
+        } else {
+            root.name.clone()
+        };
+        return Ok(MasterManifest {
+            name: ns.clone(),
+            version: root.default_version.clone(),
+            repos: vec![RepoEntry {
+                name: ns,
+                repo_type: "git".to_string(),
+                url: None,
+                suite: None,
+                components: Vec::new(),
+                repo: None,
+                path: Some(pkg_file.to_string()),
+            }],
+        });
+    }
+
+    if !root.repos.is_empty() || mode == "inline" {
+        return Ok(MasterManifest {
+            name: root.name,
+            version: root.default_version,
+            repos: root.repos,
+        });
+    }
+
+    // "repository", "flat", "master", or default with repository_file
+    parse_master(repo_file)
 }
 
 pub fn resolve_master_manifest_local(dir: &Path) -> Result<MasterManifest, String> {
+    let manifest_path = dir.join("manifest.json");
+    if manifest_path.exists() {
+        let raw = fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("Failed to read {}: {e}", manifest_path.display()))?;
+        let root = serde_json::from_str::<RootManifest>(&raw)
+            .map_err(|e| format!("Invalid JSON in {}: {e}", manifest_path.display()))?;
+        return resolve_root_manifest_with(
+            root,
+            &|rel| {
+                let p = dir.join(rel);
+                fs::read_to_string(&p).map_err(|e| format!("Failed to read {}: {e}", p.display()))
+            },
+            &|versions_dir, repo_file| find_latest_local_version(dir, versions_dir, repo_file),
+        );
+    }
+
     if let Some(ver) = detect_target_os_version() {
         let ver_dir = dir.join("versions").join(&ver);
         if ver_dir.join("repository.json").exists() {
@@ -130,7 +221,7 @@ pub fn resolve_master_manifest_local(dir: &Path) -> Result<MasterManifest, Strin
                 dir.display()
             ));
         }
-    } else if let Some(latest) = find_latest_local_version(dir) {
+    } else if let Some(latest) = find_latest_local_version(dir, "versions", "repository.json") {
         let ver_dir = dir.join("versions").join(&latest);
         return ConfigManager::load_manifest_from_dir(&ver_dir);
     }
@@ -139,13 +230,23 @@ pub fn resolve_master_manifest_local(dir: &Path) -> Result<MasterManifest, Strin
 }
 
 pub fn resolve_master_manifest_github(slug: &str) -> Result<MasterManifest, String> {
+    if let Ok(raw) = fetch_github_raw_file(slug, "manifest.json") {
+        let root = serde_json::from_str::<RootManifest>(&raw)
+            .map_err(|e| format!("Invalid manifest.json in '{slug}': {e}"))?;
+        return resolve_root_manifest_with(
+            root,
+            &|rel| fetch_github_raw_file(slug, rel),
+            &|versions_dir, _repo_file| find_latest_github_version(slug, versions_dir).ok(),
+        );
+    }
+
     if let Some(ver) = detect_target_os_version() {
         let ver_path = format!("versions/{ver}/repository.json");
         if let Ok(ver_raw) = fetch_github_raw_file(slug, &ver_path) {
             return serde_json::from_str::<MasterManifest>(&ver_raw)
                 .map_err(|_| format!("Invalid {ver_path} in master repo '{slug}'"));
         }
-    } else if let Ok(latest) = find_latest_github_version(slug) {
+    } else if let Ok(latest) = find_latest_github_version(slug, "versions") {
         let ver_path = format!("versions/{latest}/repository.json");
         if let Ok(ver_raw) = fetch_github_raw_file(slug, &ver_path) {
             return serde_json::from_str::<MasterManifest>(&ver_raw)

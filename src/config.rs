@@ -173,7 +173,7 @@ impl ConfigManager {
     }
 
     pub fn find_manifest_in_dir(dir: &Path) -> Option<PathBuf> {
-        for filename in ["repository.json", "pkg-master.json", "manifest.json", "repos.json"] {
+        for filename in ["repository.json", "pkg-master.json", "repos.json"] {
             let p = dir.join(filename);
             if p.exists() {
                 return Some(p);

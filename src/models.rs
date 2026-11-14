@@ -1,6 +1,25 @@
 use serde::{Deserialize, Serialize};
 
-/// Simple JSON manifest for a master repository (e.g., pkg-master/repository.json)
+/// Modular root descriptor (`manifest.json`) at the root of a repository
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RootManifest {
+    #[serde(default)]
+    pub name: String,
+    #[serde(rename = "type", alias = "layout", default)]
+    pub repo_type: String,
+    #[serde(default)]
+    pub default_version: Option<String>,
+    #[serde(default)]
+    pub versions_dir: Option<String>,
+    #[serde(default)]
+    pub repository_file: Option<String>,
+    #[serde(default)]
+    pub packages_file: Option<String>,
+    #[serde(default)]
+    pub repos: Vec<RepoEntry>,
+}
+
+/// Simple JSON manifest for a master repository (e.g., versions/<ver>/repository.json)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MasterManifest {
     pub name: String,
